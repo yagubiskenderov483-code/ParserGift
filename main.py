@@ -200,10 +200,16 @@ async def start_pollers(bot: Bot):
     )
 
 async def main():
-    # Client и Event создаём ТОЛЬКО внутри running loop —
-    # иначе Pyrogram падает с "Future attached to a different loop"
+    # Client/Event только внутри running loop + явный loop=
+    # иначе Pyrogram: "Future attached to a different loop"
+    loop = asyncio.get_running_loop()
     state_data["login_done"] = asyncio.Event()
-    pyro = Client(SESSION_NAME, api_id=API_ID, api_hash=API_HASH)
+    pyro = Client(
+        SESSION_NAME,
+        api_id=API_ID,
+        api_hash=API_HASH,
+        loop=loop,
+    )
     state_data["pyro"] = pyro
 
     bot = Bot(token=BOT_TOKEN)
