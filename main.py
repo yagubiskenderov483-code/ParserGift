@@ -19,15 +19,14 @@ from config import (
     BOT_TOKEN, API_ID, API_HASH, SESSION_NAME, MRKT_SESSION_NAME,
     POLL_INTERVAL_TONNEL, POLL_INTERVAL_PORTALS, POLL_INTERVAL_MRKT,
     PORTALS_AUTH_REFRESH_EVERY, FETCH_LIMIT,
-    load_chat_id, save_chat_id, save_portals_auth,
+    load_chat_id, save_chat_id, save_portals_auth, load_portals_auth,
 )
 from storage import SeenStore
 from notifier import notify
 from adapters import tonnel_adapter, portals_adapter, mrkt_adapter
 
 seen = SeenStore()
-state_data = {"chat_id": load_chat_id()}
-login_done = asyncio.Event()
+state_data: dict = {"chat_id": load_chat_id(), "pyro": None, "login_done": None}
 
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -36,7 +35,17 @@ class Login(StatesGroup):
     code = State()
     password = State()
 
-pyro = Client(SESSION_NAME, api_id=API_ID, api_hash=API_HASH)
+def get_pyro() -> Client:
+    client = state_data["pyro"]
+    if client is None:
+        raise RuntimeError("Pyrogram client is not initialized yet")
+    return client
+
+def get_login_done() -> asyncio.Event:
+    event = state_data["login_done"]
+    if event is None:
+        raise RuntimeError("login_done event is not initialized yet")
+    return event
 
 def sync_mrkt_session():
     """После логина копируем сессию для MRKT (amrkt), чтобы не входить второй раз."""
@@ -50,6 +59,7 @@ def sync_mrkt_session():
 
 async def fetch_portals_auth():
     """Достаём tgWebAppData для Portals через уже залогиненный аккаунт."""
+    pyro = get_pyro()
     peer = await pyro.resolve_peer("portals")
     user_full = await pyro.invoke(GetUsers(id=[peer]))
     bot_raw = user_full[0]
@@ -74,7 +84,7 @@ async def on_start(message: Message, fsm: FSMContext):
             "Уже привязан. Буду моментально присылать новые лоты "
             "(2–60k TON: лёгкий / средний / сложный / хардкор)."
         )
-        login_done.set()
+        get_login_done().set()
         return
 
     await fsm.set_state(Login.phone)
@@ -87,7 +97,7 @@ async def on_start(message: Message, fsm: FSMContext):
 async def got_phone(message: Message, fsm: FSMContext):
     phone = message.text.strip()
     try:
-        sent = await pyro.send_code(phone)
+        sent = await get_pyro().send_code(phone)
     except PhoneNumberInvalid:
         await message.answer("Неверный формат номера, попробуй ещё раз (+79991234567)")
         return
@@ -100,7 +110,7 @@ async def got_code(message: Message, fsm: FSMContext):
     data = await fsm.get_data()
     code = message.text.strip()
     try:
-        await pyro.sign_in(data["phone"], data["phone_code_hash"], code)
+        await get_pyro().sign_in(data["phone"], data["phone_code_hash"], code)
     except SessionPasswordNeeded:
         await fsm.set_state(Login.password)
         await message.answer("На аккаунте включён облачный пароль (2FA). Пришли его сюда.")
@@ -113,7 +123,7 @@ async def got_code(message: Message, fsm: FSMContext):
 @dp.message(Login.password)
 async def got_password(message: Message, fsm: FSMContext):
     try:
-        await pyro.check_password(message.text.strip())
+        await get_pyro().check_password(message.text.strip())
     except Exception as e:
         await message.answer(f"Пароль не подошёл: {e}\nПопробуй ещё раз.")
         return
@@ -130,7 +140,7 @@ async def finish_login(message: Message, fsm: FSMContext):
         "✅ Готово! Аккаунт привязан.\n"
         "Слежу за Tonnel / Portals / MRKT и сразу шлю новые лоты 2–60k TON."
     )
-    login_done.set()
+    get_login_done().set()
 
 @dp.message()
 async def on_any_message(message: Message, fsm: FSMContext):
@@ -163,21 +173,20 @@ async def poll_source(bot: Bot, source_name: str, fetch_fn, interval: int):
         await asyncio.sleep(interval)
 
 async def refresh_portals_auth_loop():
-    await login_done.wait()
+    await get_login_done().wait()
     while True:
         await asyncio.sleep(PORTALS_AUTH_REFRESH_EVERY)
         try:
+            pyro = get_pyro()
             if pyro.is_connected:
                 await fetch_portals_auth()
         except Exception as e:
             print(f"[portals] auth refresh error: {e}")
 
 async def start_pollers(bot: Bot):
-    await login_done.wait()
-    # подтягиваем Portals auth, если ещё нет
+    await get_login_done().wait()
     try:
-        from config import load_portals_auth
-        if not load_portals_auth() and pyro.is_connected:
+        if not load_portals_auth() and get_pyro().is_connected:
             await fetch_portals_auth()
     except Exception as e:
         print(f"[portals] initial auth: {e}")
@@ -191,23 +200,33 @@ async def start_pollers(bot: Bot):
     )
 
 async def main():
+    # Client и Event создаём ТОЛЬКО внутри running loop —
+    # иначе Pyrogram падает с "Future attached to a different loop"
+    state_data["login_done"] = asyncio.Event()
+    pyro = Client(SESSION_NAME, api_id=API_ID, api_hash=API_HASH)
+    state_data["pyro"] = pyro
+
     bot = Bot(token=BOT_TOKEN)
     await pyro.connect()
 
     if os.path.exists(f"{SESSION_NAME}.session"):
         try:
-            # если сессия уже есть — убедимся, что авторизованы
             me = await pyro.get_me()
             print(f"Session OK: {me.first_name} (@{me.username})")
-            login_done.set()
+            get_login_done().set()
         except Exception as e:
             print(f"Session exists but not authorized yet: {e}")
 
     print("Напиши боту /start в Telegram.")
-    await asyncio.gather(
-        dp.start_polling(bot),
-        start_pollers(bot),
-    )
+    try:
+        await asyncio.gather(
+            dp.start_polling(bot),
+            start_pollers(bot),
+        )
+    finally:
+        if pyro.is_connected:
+            await pyro.disconnect()
+        await bot.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
