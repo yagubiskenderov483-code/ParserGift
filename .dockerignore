@@ -2,13 +2,11 @@
 !requirements.txt
 !Dockerfile
 !.dockerignore
-!app.py
 !main.py
 !config.py
-!db.py
-!notify.py
-!markets/
-!markets/**
+!parse_tonnel.py
+!parse_portals.py
+!parse_mrkt.py
 __pycache__
 *.pyc
 .venv

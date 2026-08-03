@@ -1,29 +1,18 @@
 FROM python:3.11-slim-bookworm
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PARSERGIFT_BUILD=scratch-2026-08-03
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends gcc libffi-dev \
-    && rm -rf /var/lib/apt/lists/*
+ && apt-get install -y --no-install-recommends gcc libffi-dev \
+ && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY config.py parse_tonnel.py parse_portals.py parse_mrkt.py main.py ./
 
-# Refuse to ship the broken pre-rewrite binary
-RUN python - <<'PY'
-from pathlib import Path
-app = Path("app.py").read_text(encoding="utf-8")
-assert "scratch-2026-08-03" in app, "wrong app.py"
-assert "class Runtime" in app, "missing Runtime"
-main = Path("main.py").read_text(encoding="utf-8")
-assert "from app import main" in main, "main.py must wrap app.py"
-print("image content OK")
-PY
+RUN python -c "import main; assert 'full-2026-08-03' in open('main.py').read(); print('OK')"
 
-CMD ["python", "-u", "app.py"]
+CMD ["python", "-u", "main.py"]

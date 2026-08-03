@@ -1,3 +1,5 @@
+"""MRKT — лента get_feed(), только type=listing, 2k–60k TON."""
+
 from __future__ import annotations
 
 import os
@@ -6,26 +8,25 @@ import shutil
 from amrkt import MarketClient
 
 from config import API_HASH, API_ID, LIMIT, MRKT_SESSION, PRICE_MAX, PRICE_MIN, SESSION
-from db import Lot
 
-LINK = "https://t.me/mrkt/app"
+URL = "https://t.me/mrkt/app"
 
 _client: MarketClient | None = None
 
 
-def _copy_session() -> None:
+def ensure_session() -> None:
     src, dst = f"{SESSION}.session", f"{MRKT_SESSION}.session"
     if os.path.exists(src) and not os.path.exists(dst):
         try:
             shutil.copy2(src, dst)
         except Exception as e:
-            print(f"[mrkt] copy session: {e}")
+            print(f"[mrkt] session: {e}")
 
 
-async def _get() -> MarketClient:
+async def _client_get() -> MarketClient:
     global _client
     if _client is None:
-        _copy_session()
+        ensure_session()
         _client = MarketClient(
             api_id=API_ID,
             api_hash=API_HASH,
@@ -35,34 +36,34 @@ async def _get() -> MarketClient:
     return _client
 
 
-async def latest(limit: int = LIMIT) -> list[Lot]:
+async def fetch_new(limit: int = LIMIT) -> list[dict]:
     try:
-        client = await _get()
+        client = await _client_get()
         feed = await client.get_feed()
     except Exception as e:
         print(f"[mrkt] {e}")
         return []
 
-    lots: list[Lot] = []
+    out = []
     for item in feed.items or []:
         if getattr(item, "type", None) != "listing":
             continue
         try:
             price = float(item.amount_ton)
-            if price < PRICE_MIN or price > PRICE_MAX:
+            if not (PRICE_MIN <= price <= PRICE_MAX):
                 continue
-            lots.append(
-                Lot(
-                    market="MRKT",
-                    lot_id=f"mrkt:{item.id}",
-                    title=item.gift.title,
-                    model=getattr(item.gift, "model_title", None),
-                    price=price,
-                    link=LINK,
-                )
+            out.append(
+                {
+                    "id": f"mrkt:{item.id}",
+                    "market": "MRKT",
+                    "title": item.gift.title,
+                    "model": getattr(item.gift, "model_title", None),
+                    "price": price,
+                    "url": URL,
+                }
             )
-            if len(lots) >= limit:
+            if len(out) >= limit:
                 break
         except Exception:
             continue
-    return lots
+    return out
