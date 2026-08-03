@@ -1,43 +1,67 @@
-from amrkt import MarketClient
-from adapters.base import Listing
-from config import API_ID, API_HASH
+import asyncio
+from aiogram import Bot, Dispatcher
+from aiogram.filters import CommandStart
+from aiogram.types import Message
 
-SOURCE = "MRKT"
+from config import BOT_TOKEN, POLL_INTERVAL_TONNEL, POLL_INTERVAL_PORTALS, POLL_INTERVAL_MRKT, load_chat_id, save_chat_id
+from storage import SeenStore
+from notifier import notify
+from adapters import tonnel_adapter, portals_adapter, mrkt_adapter
 
-_client: MarketClient | None = None
+seen = SeenStore()
+state = {"chat_id": load_chat_id()}  # подхватываем сохранённый chat_id, если бот уже запускался
 
-async def get_client() -> MarketClient:
-    global _client
-    if _client is None:
-        _client = MarketClient(
-            api_id=API_ID,
-            api_hash=API_HASH,
-            session_name="mrkt_session",   # при первом запуске попросит войти в Telegram (номер/код)
-        )
-        await _client.__aenter__()
-    return _client
+dp = Dispatcher()
 
-async def fetch_latest(limit: int = 20) -> list[Listing]:
-    try:
-        client = await get_client()
-        feed = await client.get_feed()
-    except Exception as e:
-        print(f"[mrkt] fetch error: {e}")
-        return []
+@dp.message(CommandStart())
+async def on_start(message: Message):
+    state["chat_id"] = message.chat.id
+    save_chat_id(message.chat.id)
+    await message.answer(
+        "Готово! Буду присылать новые лоты сюда.\n"
+        "Категории: 🟢 2-5к / 🟡 5-10к / 🔴 10-20к / 💎 20-60к (TON)."
+    )
 
-    listings = []
-    for item in (feed.items or [])[:limit]:
-        if item.type != "listing":
-            continue
+@dp.message()
+async def on_any_message(message: Message):
+    # на случай если человек написал что-то до /start — тоже подхватываем чат
+    if state["chat_id"] is None:
+        state["chat_id"] = message.chat.id
+        save_chat_id(message.chat.id)
+        await message.answer("Готово! Буду присылать новые лоты сюда.")
+
+async def poll_source(bot: Bot, source_name: str, fetch_fn, interval: int):
+    first_run = True
+    while True:
         try:
-            listings.append(Listing(
-                source=SOURCE,
-                item_id=str(item.id),
-                name=item.gift.title,
-                model=item.gift.model_title,
-                price=float(item.amount_ton),
-                url="https://t.me/mrkt/app",
-            ))
-        except Exception:
-            continue
-    return listings
+            listings = await fetch_fn(limit=20)
+            if first_run:
+                for listing in listings:
+                    seen.mark_seen(source_name, listing.item_id)
+                first_run = False
+            else:
+                for listing in reversed(listings):
+                    if seen.is_new(source_name, listing.item_id):
+                        seen.mark_seen(source_name, listing.item_id)
+                        if state["chat_id"]:
+                            await notify(bot, state["chat_id"], listing)
+        except Exception as e:
+            print(f"[{source_name}] poll loop error: {e}")
+        await asyncio.sleep(interval)
+
+async def main():
+    bot = Bot(token=BOT_TOKEN)
+
+    if state["chat_id"] is None:
+        print("Чат ещё не выбран. Напиши боту /start в Telegram — он сам запомнит куда слать лоты.")
+
+    pollers = [
+        poll_source(bot, "tonnel", tonnel_adapter.fetch_latest, POLL_INTERVAL_TONNEL),
+        poll_source(bot, "portals", portals_adapter.fetch_latest, POLL_INTERVAL_PORTALS),
+        poll_source(bot, "mrkt", mrkt_adapter.fetch_latest, POLL_INTERVAL_MRKT),
+    ]
+
+    await asyncio.gather(dp.start_polling(bot), *pollers)
+
+if __name__ == "__main__":
+    asyncio.run(main())
