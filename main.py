@@ -1,4 +1,8 @@
-"""Gift lot watcher: Tonnel / Portals / MRKT → Telegram alerts."""
+"""Gift lot watcher: Tonnel / Portals / MRKT → Telegram.
+
+Build stamp must appear in container logs. If logs still show the old
+startup crash at main.py:148 — the host is running a stale image/commit.
+"""
 
 from __future__ import annotations
 
@@ -37,6 +41,8 @@ from config import (
 from notifier import notify
 from storage import SeenStore
 
+BUILD = os.getenv("PARSERGIFT_BUILD", "2026-08-03-v3-rewrite")
+
 
 class Login(StatesGroup):
     phone = State()
@@ -44,9 +50,17 @@ class Login(StatesGroup):
     password = State()
 
 
-class App:
-    """Everything that must live on the running event loop."""
+def _new_pyro() -> Client:
+    """Always create Client on the currently running loop."""
+    return Client(
+        SESSION_NAME,
+        api_id=API_ID,
+        api_hash=API_HASH,
+        loop=asyncio.get_running_loop(),
+    )
 
+
+class App:
     def __init__(self) -> None:
         self.seen = SeenStore()
         self.chat_id = load_chat_id()
@@ -75,19 +89,40 @@ class App:
             except Exception as e:
                 print(f"[session] {e}")
 
+    async def with_pyro(self, fn):
+        """Short-lived pyrogram session — connect, work, disconnect."""
+        client = _new_pyro()
+        await client.connect()
+        try:
+            return await fn(client)
+        finally:
+            if client.is_connected:
+                await client.disconnect()
+
     async def refresh_portals_auth(self) -> None:
-        assert self.pyro is not None
-        peer = await self.pyro.resolve_peer("portals")
-        users = await self.pyro.invoke(GetUsers(id=[peer]))
-        bot_raw = users[0]
-        bot = InputUser(user_id=bot_raw.id, access_hash=bot_raw.access_hash)
-        app = InputBotAppShortName(bot_id=bot, short_name="market")
-        view = await self.pyro.invoke(
-            RequestAppWebView(peer=peer, app=app, platform="desktop")
-        )
-        raw = unquote(view.url.split("tgWebAppData=", 1)[1].split("&tgWebAppVersion", 1)[0])
-        save_portals_auth(f"tma {raw}")
-        print("[portals] auth ok")
+        async def _do(client: Client) -> None:
+            peer = await client.resolve_peer("portals")
+            users = await client.invoke(GetUsers(id=[peer]))
+            bot_raw = users[0]
+            bot = InputUser(user_id=bot_raw.id, access_hash=bot_raw.access_hash)
+            app = InputBotAppShortName(bot_id=bot, short_name="market")
+            view = await client.invoke(
+                RequestAppWebView(peer=peer, app=app, platform="desktop")
+            )
+            raw = unquote(
+                view.url.split("tgWebAppData=", 1)[1].split("&tgWebAppVersion", 1)[0]
+            )
+            save_portals_auth(f"tma {raw}")
+            print("[portals] auth ok")
+
+        await self.with_pyro(_do)
+
+    async def ensure_login_client(self) -> Client:
+        """Long-lived client only while phone/code login is in progress."""
+        if self.pyro is None or not self.pyro.is_connected:
+            self.pyro = _new_pyro()
+            await self.pyro.connect()
+        return self.pyro
 
     async def on_start(self, message: Message, state: FSMContext) -> None:
         self.chat_id = message.chat.id
@@ -95,12 +130,13 @@ class App:
 
         if os.path.exists(f"{SESSION_NAME}.session"):
             await message.answer(
-                "Уже привязан. Шлю новые лоты 2–60k TON "
-                "(лёгкий / средний / сложный / хардкор)."
+                f"Уже привязан (build {BUILD}).\n"
+                "Шлю новые лоты 2–60k TON (лёгкий / средний / сложный / хардкор)."
             )
-            self.login_done.set()
+            self.ready().set()
             return
 
+        await self.ensure_login_client()
         await state.set_state(Login.phone)
         await message.answer(
             "Первый запуск — привяжи Telegram-аккаунт (MRKT + Portals).\n"
@@ -108,10 +144,10 @@ class App:
         )
 
     async def on_phone(self, message: Message, state: FSMContext) -> None:
-        assert self.pyro is not None
+        client = await self.ensure_login_client()
         phone = (message.text or "").strip()
         try:
-            sent = await self.pyro.send_code(phone)
+            sent = await client.send_code(phone)
         except PhoneNumberInvalid:
             await message.answer("Неверный номер. Пример: +79991234567")
             return
@@ -120,11 +156,11 @@ class App:
         await message.answer("Код ушёл в Telegram. Пришли его сюда.")
 
     async def on_code(self, message: Message, state: FSMContext) -> None:
-        assert self.pyro is not None
+        client = await self.ensure_login_client()
         data = await state.get_data()
         code = (message.text or "").strip()
         try:
-            await self.pyro.sign_in(data["phone"], data["phone_code_hash"], code)
+            await client.sign_in(data["phone"], data["phone_code_hash"], code)
         except SessionPasswordNeeded:
             await state.set_state(Login.password)
             await message.answer("Нужен облачный пароль (2FA). Пришли его.")
@@ -135,9 +171,9 @@ class App:
         await self._finish_login(message, state)
 
     async def on_password(self, message: Message, state: FSMContext) -> None:
-        assert self.pyro is not None
+        client = await self.ensure_login_client()
         try:
-            await self.pyro.check_password((message.text or "").strip())
+            await client.check_password((message.text or "").strip())
         except Exception as e:
             await message.answer(f"Пароль не подошёл: {e}")
             return
@@ -150,8 +186,12 @@ class App:
             await self.refresh_portals_auth()
         except Exception as e:
             print(f"[portals] auth error: {e}")
-        await message.answer("✅ Готово. Слежу за новыми лотами 2–60k TON.")
-        self.login_done.set()
+        # login client no longer needed
+        if self.pyro and self.pyro.is_connected:
+            await self.pyro.disconnect()
+        self.pyro = None
+        await message.answer(f"✅ Готово (build {BUILD}). Слежу за лотами 2–60k TON.")
+        self.ready().set()
 
     async def on_any(self, message: Message, state: FSMContext) -> None:
         if await state.get_state() is not None:
@@ -166,7 +206,9 @@ class App:
             try:
                 listings = await fetch(limit=FETCH_LIMIT)
                 had = self.seen.has_history(name)
-                fresh = [x for x in reversed(listings) if self.seen.is_new(name, x.item_id)]
+                fresh = [
+                    x for x in reversed(listings) if self.seen.is_new(name, x.item_id)
+                ]
                 if fresh:
                     self.seen.mark_many(name, [x.item_id for x in fresh])
                     if had and self.chat_id and self.bot:
@@ -177,19 +219,18 @@ class App:
             await asyncio.sleep(POLL_INTERVAL)
 
     async def portals_auth_loop(self) -> None:
-        await self.login_done.wait()
+        await self.ready().wait()
         while True:
             await asyncio.sleep(PORTALS_AUTH_REFRESH)
             try:
-                if self.pyro and self.pyro.is_connected:
-                    await self.refresh_portals_auth()
+                await self.refresh_portals_auth()
             except Exception as e:
                 print(f"[portals] refresh: {e}")
 
     async def run_pollers(self) -> None:
-        await self.login_done.wait()
+        await self.ready().wait()
         try:
-            if not load_portals_auth() and self.pyro and self.pyro.is_connected:
+            if not load_portals_auth() and os.path.exists(f"{SESSION_NAME}.session"):
                 await self.refresh_portals_auth()
         except Exception as e:
             print(f"[portals] init auth: {e}")
@@ -203,28 +244,17 @@ class App:
         )
 
     async def run(self) -> None:
-        loop = asyncio.get_running_loop()
-        # Event создаём здесь — уже на running loop
         self.login_done = asyncio.Event()
-        self.pyro = Client(
-            SESSION_NAME,
-            api_id=API_ID,
-            api_hash=API_HASH,
-            loop=loop,
-        )
         self.bot = Bot(token=BOT_TOKEN)
 
-        await self.pyro.connect()
-
+        # IMPORTANT: no pyro.connect() on startup — that was the Docker crash.
         if os.path.exists(f"{SESSION_NAME}.session"):
-            try:
-                me = await self.pyro.get_me()
-                print(f"session ok: {me.first_name}")
-                self.login_done.set()
-            except Exception as e:
-                print(f"session present but not ready: {e}")
+            print(f"[{BUILD}] session file found — skip pyro startup connect")
+            self.login_done.set()
+        else:
+            print(f"[{BUILD}] no session yet — wait for /start login")
 
-        print("Напиши боту /start")
+        print(f"[{BUILD}] Напиши боту /start")
         try:
             await asyncio.gather(
                 self.dp.start_polling(self.bot),
@@ -238,7 +268,7 @@ class App:
 
 
 async def _amain() -> None:
-    # App создаётся уже внутри asyncio.run → один и тот же loop
+    print(f"=== ParserGift {BUILD} starting ===")
     await App().run()
 
 
