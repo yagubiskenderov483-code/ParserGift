@@ -1,0 +1,4 @@
+aiogram>=3.30
+tonnelmp>=1.2
+portalsmp>=1.2
+amrkt>=1.6
