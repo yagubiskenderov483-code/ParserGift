@@ -4,13 +4,18 @@ import json
 # === Telegram bot ===
 BOT_TOKEN = "8952681622:AAGEe2m5L6jWxlFcw-gF_NIl9UbGDTW33Vc"
 
-# === Твой личный Telegram-аккаунт (нужен для MRKT и Portals) ===
+# === Личный Telegram-аккаунт (MRKT + Portals) ===
 API_ID = 36101343
 API_HASH = "116195fa5e0459d25a9a6266b40807d7"
 
-SESSION_NAME = "user_session"  # файл user_session.session появится после первого /start
+SESSION_NAME = "user_session"  # появляется после первого /start
+MRKT_SESSION_NAME = "mrkt_session"
 
 # === Ценовые категории (в TON) ===
+# лёгкий 2–5к · средний 5–10к · сложный 10–20к · хардкор 20–60к
+PRICE_MIN = 2000
+PRICE_MAX = 60000
+
 PRICE_TIERS = [
     ("🟢 Лёгкий", 2000, 5000),
     ("🟡 Средний", 5000, 10000),
@@ -19,15 +24,25 @@ PRICE_TIERS = [
 ]
 
 def classify_price(price: float) -> str | None:
-    for label, lo, hi in PRICE_TIERS:
-        if lo <= price < hi:
+    """Категория по цене. Границы: [lo, hi), у последнего тира hi включительно."""
+    if price < PRICE_MIN or price > PRICE_MAX:
+        return None
+    for i, (label, lo, hi) in enumerate(PRICE_TIERS):
+        last = i == len(PRICE_TIERS) - 1
+        if lo <= price < hi or (last and price == hi):
             return label
     return None
 
-# === Интервалы поллинга (сек) ===
-POLL_INTERVAL_TONNEL = 5
-POLL_INTERVAL_PORTALS = 5
-POLL_INTERVAL_MRKT = 5
+# === Интервалы поллинга (сек) — ближе к «моментально» ===
+POLL_INTERVAL_TONNEL = 1
+POLL_INTERVAL_PORTALS = 1
+POLL_INTERVAL_MRKT = 1
+
+# Сколько свежих лотов забирать за один запрос
+FETCH_LIMIT = 30
+
+# Раз в N секунд обновляем Portals auth (tgWebAppData протухает)
+PORTALS_AUTH_REFRESH_EVERY = 6 * 60 * 60
 
 SEEN_STORE_PATH = "seen.json"
 CHAT_ID_STORE_PATH = "chat_id.json"

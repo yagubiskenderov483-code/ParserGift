@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.session
+*.session-journal
+seen.json
+chat_id.json
+portals_auth.json
+.env
+*.log

@@ -1,5 +1,6 @@
 import asyncio
 import os
+import shutil
 
 from aiogram import Bot, Dispatcher
 from aiogram.filters import CommandStart
@@ -9,13 +10,15 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message
 from pyrogram import Client
 from pyrogram.raw.functions.messages import RequestAppWebView
+from pyrogram.raw.functions.users import GetUsers
 from pyrogram.raw.types import InputBotAppShortName, InputUser
 from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PhoneNumberInvalid
 from urllib.parse import unquote
 
 from config import (
-    BOT_TOKEN, API_ID, API_HASH, SESSION_NAME,
+    BOT_TOKEN, API_ID, API_HASH, SESSION_NAME, MRKT_SESSION_NAME,
     POLL_INTERVAL_TONNEL, POLL_INTERVAL_PORTALS, POLL_INTERVAL_MRKT,
+    PORTALS_AUTH_REFRESH_EVERY, FETCH_LIMIT,
     load_chat_id, save_chat_id, save_portals_auth,
 )
 from storage import SeenStore
@@ -35,15 +38,31 @@ class Login(StatesGroup):
 
 pyro = Client(SESSION_NAME, api_id=API_ID, api_hash=API_HASH)
 
+def sync_mrkt_session():
+    """После логина копируем сессию для MRKT (amrkt), чтобы не входить второй раз."""
+    src = f"{SESSION_NAME}.session"
+    dst = f"{MRKT_SESSION_NAME}.session"
+    if os.path.exists(src):
+        try:
+            shutil.copy2(src, dst)
+        except Exception as e:
+            print(f"[login] mrkt session copy: {e}")
+
 async def fetch_portals_auth():
     """Достаём tgWebAppData для Portals через уже залогиненный аккаунт."""
-    bot_entity = await pyro.get_users("portals")
     peer = await pyro.resolve_peer("portals")
-    bot = InputUser(user_id=bot_entity.id, access_hash=bot_entity.raw.access_hash)
+    user_full = await pyro.invoke(GetUsers(id=[peer]))
+    bot_raw = user_full[0]
+    bot = InputUser(user_id=bot_raw.id, access_hash=bot_raw.access_hash)
     bot_app = InputBotAppShortName(bot_id=bot, short_name="market")
-    web_view = await pyro.invoke(RequestAppWebView(peer=peer, app=bot_app, platform="android"))
-    init_data = unquote(web_view.url.split("tgWebAppData=", 1)[1].split("&tgWebAppVersion", 1)[0])
-    save_portals_auth(init_data)
+    web_view = await pyro.invoke(
+        RequestAppWebView(peer=peer, app=bot_app, platform="desktop")
+    )
+    init_data = unquote(
+        web_view.url.split("tgWebAppData=", 1)[1].split("&tgWebAppVersion", 1)[0]
+    )
+    save_portals_auth(f"tma {init_data}")
+    print("[portals] auth refreshed")
 
 @dp.message(CommandStart())
 async def on_start(message: Message, fsm: FSMContext):
@@ -51,7 +70,10 @@ async def on_start(message: Message, fsm: FSMContext):
     save_chat_id(message.chat.id)
 
     if os.path.exists(f"{SESSION_NAME}.session"):
-        await message.answer("Уже привязан. Буду присылать новые лоты сюда.")
+        await message.answer(
+            "Уже привязан. Буду моментально присылать новые лоты "
+            "(2–60k TON: лёгкий / средний / сложный / хардкор)."
+        )
         login_done.set()
         return
 
@@ -99,48 +121,73 @@ async def got_password(message: Message, fsm: FSMContext):
 
 async def finish_login(message: Message, fsm: FSMContext):
     await fsm.clear()
+    sync_mrkt_session()
     try:
         await fetch_portals_auth()
     except Exception as e:
         print(f"[login] portals auth error: {e}")
-    await message.answer("✅ Готово! Аккаунт привязан, начинаю парсить лоты.")
+    await message.answer(
+        "✅ Готово! Аккаунт привязан.\n"
+        "Слежу за Tonnel / Portals / MRKT и сразу шлю новые лоты 2–60k TON."
+    )
     login_done.set()
 
 @dp.message()
 async def on_any_message(message: Message, fsm: FSMContext):
     cur = await fsm.get_state()
     if cur is not None:
-        return  # мы посреди логина, ждём ответ по сценарию выше
+        return  # посреди логина
     if state_data["chat_id"] is None:
         state_data["chat_id"] = message.chat.id
         save_chat_id(message.chat.id)
         await message.answer("Готово! Буду присылать новые лоты сюда.")
 
 async def poll_source(bot: Bot, source_name: str, fetch_fn, interval: int):
-    first_run = True
+    """Поллинг ~каждую секунду. Первый проход (или пустой seen) только засеивает id,
+    дальше — моментальные пуши по новым лотам."""
     while True:
         try:
-            listings = await fetch_fn(limit=20)
-            if first_run:
-                for listing in listings:
-                    seen.mark_seen(source_name, listing.item_id)
-                first_run = False
-            else:
-                for listing in reversed(listings):
-                    if seen.is_new(source_name, listing.item_id):
-                        seen.mark_seen(source_name, listing.item_id)
-                        if state_data["chat_id"]:
-                            await notify(bot, state_data["chat_id"], listing)
+            listings = await fetch_fn(limit=FETCH_LIMIT)
+            had_history = seen.has_history(source_name)
+            fresh: list = []
+            for listing in reversed(listings):
+                if seen.is_new(source_name, listing.item_id):
+                    fresh.append(listing)
+            if fresh:
+                seen.mark_seen_many(source_name, [x.item_id for x in fresh])
+                if had_history and state_data["chat_id"]:
+                    for listing in fresh:
+                        await notify(bot, state_data["chat_id"], listing)
         except Exception as e:
             print(f"[{source_name}] poll loop error: {e}")
         await asyncio.sleep(interval)
 
+async def refresh_portals_auth_loop():
+    await login_done.wait()
+    while True:
+        await asyncio.sleep(PORTALS_AUTH_REFRESH_EVERY)
+        try:
+            if pyro.is_connected:
+                await fetch_portals_auth()
+        except Exception as e:
+            print(f"[portals] auth refresh error: {e}")
+
 async def start_pollers(bot: Bot):
-    await login_done.wait()  # ждём, пока привяжется аккаунт
+    await login_done.wait()
+    # подтягиваем Portals auth, если ещё нет
+    try:
+        from config import load_portals_auth
+        if not load_portals_auth() and pyro.is_connected:
+            await fetch_portals_auth()
+    except Exception as e:
+        print(f"[portals] initial auth: {e}")
+
+    sync_mrkt_session()
     await asyncio.gather(
         poll_source(bot, "tonnel", tonnel_adapter.fetch_latest, POLL_INTERVAL_TONNEL),
         poll_source(bot, "portals", portals_adapter.fetch_latest, POLL_INTERVAL_PORTALS),
         poll_source(bot, "mrkt", mrkt_adapter.fetch_latest, POLL_INTERVAL_MRKT),
+        refresh_portals_auth_loop(),
     )
 
 async def main():
@@ -148,7 +195,13 @@ async def main():
     await pyro.connect()
 
     if os.path.exists(f"{SESSION_NAME}.session"):
-        login_done.set()  # уже логинились раньше, сразу можно парсить
+        try:
+            # если сессия уже есть — убедимся, что авторизованы
+            me = await pyro.get_me()
+            print(f"Session OK: {me.first_name} (@{me.username})")
+            login_done.set()
+        except Exception as e:
+            print(f"Session exists but not authorized yet: {e}")
 
     print("Напиши боту /start в Telegram.")
     await asyncio.gather(
