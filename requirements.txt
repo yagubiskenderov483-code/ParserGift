@@ -1,6 +1,6 @@
-aiogram>=3.30
+aiogram==3.15.0
 tonnelmp>=1.2
 portalsmp>=1.2
 amrkt>=1.6
-pyrogram>=2.0
-tgcrypto>=1.2
+pyrogram==2.0.106
+tgcrypto==1.2.5
