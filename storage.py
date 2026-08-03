@@ -1,58 +1,56 @@
 import json
 import os
-from config import SEEN_STORE_PATH
+
+from config import SEEN_PATH
+
 
 class SeenStore:
-    """Id уже отправленных лотов по каждому маркету — без дублей.
-    Размер ограничен, файл не растёт бесконечно."""
+    MAX = 5000
 
-    MAX_PER_SOURCE = 5000
-
-    def __init__(self, path: str = SEEN_STORE_PATH):
+    def __init__(self, path: str = SEEN_PATH):
         self.path = path
         self.data: dict[str, list[str]] = {}
-        self._index: dict[str, set[str]] = {}
+        self.index: dict[str, set[str]] = {}
         self._load()
 
-    def _load(self):
+    def _load(self) -> None:
         if os.path.exists(self.path):
             try:
                 with open(self.path, "r", encoding="utf-8") as f:
                     self.data = json.load(f)
             except Exception:
                 self.data = {}
-        for source, ids in self.data.items():
-            self._index[source] = set(ids)
+        for src, ids in self.data.items():
+            self.index[src] = set(ids)
 
-    def _save(self):
+    def _save(self) -> None:
         try:
             with open(self.path, "w", encoding="utf-8") as f:
                 json.dump(self.data, f)
         except Exception as e:
-            print(f"[storage] save error: {e}")
+            print(f"[storage] {e}")
 
     def has_history(self, source: str) -> bool:
         return bool(self.data.get(source))
 
     def is_new(self, source: str, item_id: str) -> bool:
-        return item_id not in self._index.setdefault(source, set())
+        return item_id not in self.index.setdefault(source, set())
 
-    def mark_seen(self, source: str, item_id: str, *, persist: bool = True):
+    def mark_many(self, source: str, item_ids: list[str]) -> None:
         ids = self.data.setdefault(source, [])
-        idx = self._index.setdefault(source, set())
-        if item_id in idx:
-            return
-        ids.append(item_id)
-        idx.add(item_id)
-        if len(ids) > self.MAX_PER_SOURCE:
-            dropped = ids[:-self.MAX_PER_SOURCE]
-            self.data[source] = ids[-self.MAX_PER_SOURCE:]
+        idx = self.index.setdefault(source, set())
+        changed = False
+        for item_id in item_ids:
+            if item_id in idx:
+                continue
+            ids.append(item_id)
+            idx.add(item_id)
+            changed = True
+        if len(ids) > self.MAX:
+            dropped = ids[:-self.MAX]
+            self.data[source] = ids[-self.MAX:]
             for old in dropped:
                 idx.discard(old)
-        if persist:
+            changed = True
+        if changed:
             self._save()
-
-    def mark_seen_many(self, source: str, item_ids: list[str]):
-        for item_id in item_ids:
-            self.mark_seen(source, item_id, persist=False)
-        self._save()

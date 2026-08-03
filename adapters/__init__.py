@@ -1,1 +1,3 @@
-# Marketplace adapters: tonnel, portals, mrkt
+from adapters import tonnel, portals, mrkt
+
+__all__ = ["tonnel", "portals", "mrkt"]

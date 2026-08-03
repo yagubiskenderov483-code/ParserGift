@@ -1,11 +1,13 @@
 from aiogram import Bot
+
 from adapters.base import Listing
 from config import classify_price
 
-async def notify(bot: Bot, chat_id: int, listing: Listing):
+
+async def notify(bot: Bot, chat_id: int, listing: Listing) -> None:
     tier = classify_price(listing.price)
     if tier is None:
-        return  # вне 2000–60000 — пропускаем
+        return
 
     lines = [
         f"🆕 <b>{listing.name}</b>",
@@ -25,4 +27,4 @@ async def notify(bot: Bot, chat_id: int, listing: Listing):
             disable_web_page_preview=True,
         )
     except Exception as e:
-        print(f"[notifier] send error: {e}")
+        print(f"[notify] {e}")
