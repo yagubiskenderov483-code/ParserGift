@@ -1,17 +1,21 @@
 import asyncio
 from portalsmp import marketActivity
 from adapters.base import Listing
+from config import load_portals_auth
 
 SOURCE = "Portals"
 
-def _fetch_sync(limit: int = 20):
-    # activityType="listing" -> только новые выставления, не продажи/офферы
-    return marketActivity(sort="latest", limit=limit, activityType="listing")
+def _fetch_sync(limit: int, auth_data: str):
+    return marketActivity(sort="latest", limit=limit, activityType="listing", authData=auth_data)
 
 async def fetch_latest(limit: int = 20) -> list[Listing]:
+    auth_data = load_portals_auth()
+    if not auth_data:
+        return []  # ещё не привязан аккаунт, ждём /start
+
     loop = asyncio.get_running_loop()
     try:
-        raw = await loop.run_in_executor(None, _fetch_sync, limit)
+        raw = await loop.run_in_executor(None, _fetch_sync, limit, auth_data)
     except Exception as e:
         print(f"[portals] fetch error: {e}")
         return []
